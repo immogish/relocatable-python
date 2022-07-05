@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Functions to make the Python framework relocatable"""
+"""Functions to make the relocatable python"""
 
 from __future__ import print_function
 
@@ -33,37 +33,25 @@ def run(cmd):
     subprocess.check_call(cmd)
 
 
-def fix_modes(framework_dir):
+def fix_modes(dirname):
     """Make sure all files are set so owner can read/write and everyone else
        can only read"""
-    cmd = [CHMOD, "-R", "u+rw,g+r,g-w,o+r,o-w", framework_dir]
-    print("Ensuring correct modes for files in %s..." % framework_dir)
+    cmd = [CHMOD, "-R", "u+rw,g+r,g-w,o+r,o-w", dirname]
+    print("Ensuring correct modes for files in %s..." % dirname)
     subprocess.check_call(cmd)
 
 
-def framework_dir(some_file):
-    """Return parent path to framework dir"""
+def root_dir(some_file):
+    """Return parent path to root dir"""
     temp_path = some_file
+    if not os.path.isdir(temp_path):
+        temp_path = os.path.dirname(temp_path)
     while len(temp_path) > 1:
-        if temp_path.endswith(".framework"):
+        content = os.listdir(temp_path)
+        if "bin" in content:
             return temp_path
         temp_path = os.path.dirname(temp_path)
     return ""
-
-
-def framework_name(some_file):
-    """Return framework name"""
-    temp_path = some_file
-    while len(temp_path) > 1:
-        if temp_path.endswith(".framework"):
-            return os.path.basename(temp_path)
-        temp_path = os.path.dirname(temp_path)
-    return ""
-
-
-def framework_lib_name(some_file):
-    """Return framework lib name"""
-    return os.path.splitext(framework_name(some_file))[0]
 
 
 def relativize_install_name(some_file):
@@ -71,9 +59,9 @@ def relativize_install_name(some_file):
     install_name"""
     original_install_name = get_install_name(some_file)
     if original_install_name and not original_install_name.startswith("@"):
-        framework_loc = framework_dir(some_file)
+        root_loc = root_dir(some_file)
         new_install_name = os.path.join(
-            "@rpath", os.path.relpath(some_file, framework_loc)
+            "@rpath", os.path.relpath(some_file, root_loc)
         )
         cmd = [INSTALL_NAME_TOOL, "-id", new_install_name, some_file]
         run(cmd)
@@ -113,11 +101,11 @@ def get_rpaths(some_file):
 
 def add_rpath(some_file):
     """adds an rpath to the file"""
-    framework_loc = framework_dir(some_file)
+    root_loc = root_dir(some_file)
     rpath = (
         os.path.join(
             "@executable_path",
-            os.path.relpath(framework_loc, os.path.dirname(some_file)),
+            os.path.relpath(root_loc, os.path.dirname(some_file)),
         )
         + "/"
     )
@@ -179,28 +167,10 @@ def deps_contain_prefix(info_item, prefix):
     return matching_dep_items or matching_install_name
 
 
-def base_install_name(full_framework_path):
-    """Generates a base install name for the framework"""
-    versions_dir = os.path.join(full_framework_path, "Versions")
-    versions = [
-        os.path.join(versions_dir, item)
-        for item in os.listdir(versions_dir)
-        if os.path.isdir(os.path.join(versions_dir, item))
-        and not os.path.islink(os.path.join(versions_dir, item))
-    ]
-    for version_dir in versions:
-        dylib_name = os.path.join(version_dir, "Python")
-        if os.path.exists(dylib_name):
-            install_name = get_install_name(dylib_name)
-            if not install_name.startswith("@"):
-                return framework_dir(install_name)
-    return ""
-
-
-def analyze(some_dir):
+def analyze(some_dir, prefix=None):
     """Finds files we need to tweak"""
     print("Analyzing %s..." % some_dir)
-    prefix = base_install_name(some_dir)
+    prefix = prefix if prefix else some_dir
     data = {}
     data["executables"] = []
     data["dylibs"] = []
@@ -239,34 +209,39 @@ def analyze(some_dir):
     return data
 
 
-def relocatablize(framework_path):
-    """Changes install names and rpaths inside a (Python) framework to make
-    it relocatable. Might work with non-Python frameworks..."""
-    full_framework_path = os.path.abspath(
-        os.path.normpath(os.path.expanduser(framework_path))
+def relocatablize(path):
+    """Changes install names and rpaths inside
+    a python dist to make it relocatable"""
+    python_path = os.path.abspath(
+        os.path.normpath(os.path.expanduser(path))
     )
-    fix_modes(full_framework_path)
-    framework_data = analyze(full_framework_path)
+    fix_modes(python_path)
+    data = analyze(python_path)
     files_changed = set()
-    for dylib in framework_data["dylibs"]:
-        old_install_name = dylib["install_name"]
-        new_install_name = relativize_install_name(dylib["path"])
-        files_changed.add(dylib["path"])
-        # update other files with new install_name
-        if old_install_name != new_install_name:
-            files = (
-                framework_data["executables"]
-                + framework_data["dylibs"]
-                + framework_data["so_files"]
-            )
-            for item in files:
-                if old_install_name in item["dependencies"]:
-                    fix_dep(item["path"], old_install_name, new_install_name)
-                    files_changed.add(item["path"])
+    for dylib in data["dylibs"]:
+        old_install_name = dylib.get("install_name")
+        if old_install_name:
+            new_install_name = relativize_install_name(dylib["path"])
+            files_changed.add(dylib["path"])
+            # update other files with new install_name
+            if old_install_name != new_install_name:
+                files = (
+                    data["executables"]
+                    + data["dylibs"]
+                    + data["so_files"]
+                )
+                for item in files:
+                    if old_install_name in item["dependencies"]:
+                        fix_dep(item["path"], old_install_name, new_install_name)
+                        files_changed.add(item["path"])
         print()
     # add rpaths to executables
-    for item in framework_data["executables"]:
+    for item in data["executables"]:
         add_rpath(item["path"])
         files_changed.add(item["path"])
 
     return files_changed
+
+
+if __name__ == "__main__":
+    relocatablize(sys.argv[1])
